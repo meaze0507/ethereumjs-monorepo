@@ -1,7 +1,12 @@
 import { debug as createDebugLogger } from 'debug'
 import { Address, BN } from 'ethereumjs-util'
 import { Block } from '@ethereumjs/block'
-import { AccessListItem, AccessListEIP2930Transaction, TypedTransaction } from '@ethereumjs/tx'
+import {
+  AccessListItem,
+  AccessListEIP2930Transaction,
+  TypedTransaction,
+  Transaction,
+} from '@ethereumjs/tx'
 import VM from './index'
 import Bloom from './bloom'
 import { default as EVM, EVMResult } from './evm/evm'
@@ -182,7 +187,7 @@ async function _runTx(this: VM, opts: RunTxOpts): Promise<RunTxResult> {
   const { nonce, balance } = fromAccount
 
   if (!opts.skipBalance) {
-    const cost = tx.getUpfrontCost()
+    const cost = tx.getUpfrontCost(block.header.baseFeePerGas)
     if (balance.lt(cost)) {
       throw new Error(
         `sender doesn't have enough funds to send tx. The upfront cost is: ${cost} and the sender's account only has: ${balance}`
@@ -196,9 +201,21 @@ async function _runTx(this: VM, opts: RunTxOpts): Promise<RunTxResult> {
     }
   }
 
+  let gasPrice
+  let inclusionFeePerGas
+  if (this._common.isActivatedEIP(1559)) {
+    const baseFee = block.header.baseFeePerGas
+    const EIP1559Data = tx.getEIP1559Data()
+    inclusionFeePerGas = BN.min(EIP1559Data.maxInclusionFeePerGas, this.maxFeePerGas.sub(baseFee!))
+    gasPrice = inclusionFeePerGas.add(baseFee!)
+  } else {
+    // Have to cast it as legacy transaction: EIP1559 transaction does not have gas price
+    gasPrice = (<Transaction>tx).gasPrice
+  }
+
   // Update from account's nonce and balance
   fromAccount.nonce.iaddn(1)
-  const txCost = tx.gasLimit.mul(tx.gasPrice)
+  const txCost = tx.gasLimit.mul(gasPrice)
   fromAccount.balance.isub(txCost)
   await state.putAccount(caller, fromAccount)
   debug(
@@ -208,7 +225,7 @@ async function _runTx(this: VM, opts: RunTxOpts): Promise<RunTxResult> {
   /*
    * Execute message
    */
-  const txContext = new TxContext(tx.gasPrice, caller)
+  const txContext = new TxContext(gasPrice, caller)
   const { value, data, to } = tx
   const message = new Message({
     caller,
@@ -258,11 +275,11 @@ async function _runTx(this: VM, opts: RunTxOpts): Promise<RunTxResult> {
   } else {
     debug(`No tx gasRefund`)
   }
-  results.amountSpent = results.gasUsed.mul(tx.gasPrice)
+  results.amountSpent = results.gasUsed.mul(gasPrice)
 
   // Update sender's balance
   fromAccount = await state.getAccount(caller)
-  const actualTxCost = results.gasUsed.mul(tx.gasPrice)
+  const actualTxCost = results.gasUsed.mul(gasPrice)
   const txCostDiff = txCost.sub(actualTxCost)
   fromAccount.balance.iadd(txCostDiff)
   await state.putAccount(caller, fromAccount)
@@ -285,7 +302,12 @@ async function _runTx(this: VM, opts: RunTxOpts): Promise<RunTxResult> {
   }
   const minerAccount = await state.getAccount(miner)
   // add the amount spent on gas to the miner's account
-  minerAccount.balance.iadd(results.amountSpent)
+
+  if (this._common.isActivatedEIP(1559)) {
+    minerAccount.balance.iadd(results.gasUsed.mul(<BN>inclusionFeePerGas))
+  } else {
+    minerAccount.balance.iadd(results.amountSpent)
+  }
 
   // Put the miner account into the state. If the balance of the miner account remains zero, note that
   // the state.putAccount function puts this into the "touched" accounts. This will thus be removed when
